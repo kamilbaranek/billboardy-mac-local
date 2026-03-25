@@ -27,6 +27,7 @@ This means the script anonymizes both the current grid in `List1` and any smalle
 - [sync_billboard_occupancy.py](/Users/kamilbaranek/dev/billboardy/sync_billboard_occupancy.py): sync and anonymization logic
 - [run_sync.sh](/Users/kamilbaranek/dev/billboardy/run_sync.sh): non-interactive launcher for Terminal or `launchd`
 - [run_sync.command](/Users/kamilbaranek/dev/billboardy/run_sync.command): double-clickable launcher
+- [build_sync_app.sh](/Users/kamilbaranek/dev/billboardy/build_sync_app.sh): builds a Finder-launchable `.app`
 - [config.json](/Users/kamilbaranek/dev/billboardy/config.json): local config
 - [launchd/com.billboardy.occupancy-sync.plist.example](/Users/kamilbaranek/dev/billboardy/launchd/com.billboardy.occupancy-sync.plist.example): mount-trigger example
 
@@ -41,6 +42,19 @@ This means the script anonymizes both the current grid in `List1` and any smalle
 ```
 
 If the share is not mounted, the script exits immediately with `Nothing to do.`
+
+## Double-click on macOS
+
+You have two options:
+
+1. Double-click [run_sync.command](/Users/kamilbaranek/dev/billboardy/run_sync.command) in Finder.
+2. Build a small app bundle and then double-click the app:
+
+```bash
+/Users/kamilbaranek/dev/billboardy/build_sync_app.sh
+```
+
+That creates `dist/Billboardy Sync.app`, which runs the sync in the background and then shows a result dialog.
 
 ## Output layout
 
