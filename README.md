@@ -13,6 +13,8 @@ Important guarantee: the network source workbook is never opened for writing. Th
 - Any non-empty cell under a month-like header becomes `OBSAZENO`.
 - Only exact values listed in `allowed_values` stay visible.
 - The default keeps only `volný`.
+- Month columns older than the current month are removed from the anonymized output.
+- The raw local copy always stays untouched and keeps the full original workbook.
 
 Month-like headers are auto-detected across all sheets, for example:
 

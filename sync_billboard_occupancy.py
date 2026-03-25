@@ -10,6 +10,8 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +22,35 @@ from xlutils.copy import copy as xl_copy
 from xlwt.Row import StrCell
 
 
-PERIOD_HEADER_RE = re.compile(r"^(?:19|20)\d{2}(?:/\d{1,2}|(?:\s+[^\W\d_]+)+)$", re.UNICODE)
 DEFAULT_ALLOWED_VALUES = ("volný",)
+SLASH_PERIOD_RE = re.compile(r"^((?:19|20)\d{2})/(\d{1,2})$")
+NAMED_PERIOD_RE = re.compile(r"^((?:19|20)\d{2})\s+(.+)$")
+MONTH_NAME_TO_NUMBER = {
+    "leden": 1,
+    "unor": 2,
+    "brezen": 3,
+    "duben": 4,
+    "kveten": 5,
+    "cerven": 6,
+    "cervenec": 7,
+    "srpen": 8,
+    "zari": 9,
+    "rijen": 10,
+    "listopad": 11,
+    "prosinec": 12,
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
 
 
 class SyncError(RuntimeError):
@@ -202,9 +231,67 @@ def copy_source_to_local_archive(source_path: Path, destination: Path) -> dict[s
     return before
 
 
-def is_period_header(value: Any) -> bool:
+def normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(char for char in normalized if not unicodedata.combining(char)).casefold().strip()
+
+
+def parse_period_header(value: Any) -> tuple[int, int] | None:
     text = str(value).strip()
-    return bool(PERIOD_HEADER_RE.fullmatch(text))
+    if not text:
+        return None
+
+    slash_match = SLASH_PERIOD_RE.fullmatch(text)
+    if slash_match:
+        year = int(slash_match.group(1))
+        month = int(slash_match.group(2))
+        if 1 <= month <= 12:
+            return (year, month)
+        return None
+
+    named_match = NAMED_PERIOD_RE.fullmatch(text)
+    if not named_match:
+        return None
+
+    year = int(named_match.group(1))
+    remainder = normalize_text(named_match.group(2))
+    month_name = remainder.split()[0]
+    month = MONTH_NAME_TO_NUMBER.get(month_name)
+    if month is None:
+        return None
+    return (year, month)
+
+
+def current_period() -> tuple[int, int]:
+    now = datetime.now()
+    return (now.year, now.month)
+
+
+def format_period_for_state(period: tuple[int, int]) -> str:
+    return f"{period[0]:04d}-{period[1]:02d}"
+
+
+def remap_visual_column(old_column: int | None, keep_columns: list[int]) -> int | None:
+    if old_column is None or not keep_columns:
+        return old_column
+    new_column = bisect_left(keep_columns, old_column)
+    return min(new_column, len(keep_columns) - 1)
+
+
+def remap_page_breaks(page_breaks: list[int], keep_columns: list[int]) -> list[int]:
+    if not page_breaks or not keep_columns:
+        return []
+    remapped = {remap_visual_column(page_break, keep_columns) for page_break in page_breaks}
+    return sorted(value for value in remapped if value is not None)
+
+
+def find_last_meaningful_column(sheet: Any) -> int:
+    for col_index in range(sheet.ncols - 1, -1, -1):
+        for row_index in range(sheet.nrows):
+            text = str(sheet.cell_value(row_index, col_index)).strip()
+            if text:
+                return col_index
+    return -1
 
 
 def replace_cell_preserving_style(workbook: Any, sheet: Any, row_index: int, col_index: int, value: str) -> None:
@@ -215,28 +302,109 @@ def replace_cell_preserving_style(workbook: Any, sheet: Any, row_index: int, col
     row.insert_cell(col_index, StrCell(row_index, col_index, current_cell.xf_idx, workbook.add_str(value)))
 
 
-def anonymize_workbook(raw_copy_path: Path, public_output_path: Path, allowed_values: set[str], header_row_index: int) -> dict[str, Any]:
+def prune_sheet_columns(sheet: Any, keep_columns: list[int]) -> None:
+    column_mapping = {old_col: new_col for new_col, old_col in enumerate(keep_columns)}
+    rows = sheet._Worksheet__rows
+    cols = sheet._Worksheet__cols
+
+    sheet_min_col: int | None = None
+    sheet_max_col: int | None = None
+
+    for row in rows.values():
+        old_cells = row._Row__cells
+        new_cells = {}
+        for old_col, cell in sorted(old_cells.items()):
+            new_col = column_mapping.get(old_col)
+            if new_col is None:
+                continue
+            if hasattr(cell, "colx"):
+                cell.colx = new_col
+            new_cells[new_col] = cell
+
+        row._Row__cells = new_cells
+        if new_cells:
+            row_columns = sorted(new_cells)
+            row._Row__min_col_idx = row_columns[0]
+            row._Row__max_col_idx = row_columns[-1]
+            sheet_min_col = row_columns[0] if sheet_min_col is None else min(sheet_min_col, row_columns[0])
+            sheet_max_col = row_columns[-1] if sheet_max_col is None else max(sheet_max_col, row_columns[-1])
+        else:
+            row._Row__min_col_idx = 0
+            row._Row__max_col_idx = 0
+
+    new_cols = {}
+    for old_col, col_obj in sorted(cols.items()):
+        new_col = column_mapping.get(old_col)
+        if new_col is None:
+            continue
+        col_obj._index = new_col
+        new_cols[new_col] = col_obj
+        sheet_min_col = new_col if sheet_min_col is None else min(sheet_min_col, new_col)
+        sheet_max_col = new_col if sheet_max_col is None else max(sheet_max_col, new_col)
+
+    sheet._Worksheet__cols = new_cols
+
+    remapped_merged_ranges = []
+    for row_low, row_high, col_low, col_high in sheet._Worksheet__merged_ranges:
+        kept_range_columns = [column_mapping[col] for col in range(col_low, col_high) if col in column_mapping]
+        if len(kept_range_columns) != (col_high - col_low):
+            continue
+        remapped_merged_ranges.append((row_low, row_high, kept_range_columns[0], kept_range_columns[-1] + 1))
+    sheet._Worksheet__merged_ranges = remapped_merged_ranges
+
+    sheet._Worksheet__first_visible_col = remap_visual_column(sheet._Worksheet__first_visible_col, keep_columns) or 0
+    sheet._Worksheet__vert_split_first_visible = remap_visual_column(
+        sheet._Worksheet__vert_split_first_visible, keep_columns
+    )
+    sheet._Worksheet__vert_split_pos = remap_visual_column(sheet._Worksheet__vert_split_pos, keep_columns)
+    sheet._Worksheet__vert_page_breaks = remap_page_breaks(sheet._Worksheet__vert_page_breaks, keep_columns)
+
+    sheet.first_used_col = 0 if sheet_min_col is None else sheet_min_col
+    sheet.last_used_col = 0 if sheet_max_col is None else sheet_max_col
+
+
+def anonymize_workbook(
+    raw_copy_path: Path,
+    public_output_path: Path,
+    allowed_values: set[str],
+    header_row_index: int,
+    visible_from_period: tuple[int, int],
+) -> dict[str, Any]:
     read_book = xlrd.open_workbook(str(raw_copy_path), formatting_info=True)
     write_book = xl_copy(read_book)
 
     sheet_stats: list[dict[str, Any]] = []
     total_replacements = 0
     total_visible = 0
+    total_removed_columns = 0
 
     for sheet_index, read_sheet in enumerate(read_book.sheets()):
         write_sheet = write_book.get_sheet(sheet_index)
         if read_sheet.nrows <= header_row_index:
             continue
 
-        target_columns = [col for col in range(read_sheet.ncols) if is_period_header(read_sheet.cell_value(header_row_index, col))]
-        if not target_columns:
+        period_columns = {
+            col: period
+            for col in range(read_sheet.ncols)
+            if (period := parse_period_header(read_sheet.cell_value(header_row_index, col))) is not None
+        }
+        if not period_columns:
             continue
+
+        last_meaningful_column = find_last_meaningful_column(read_sheet)
+        kept_period_columns = [col for col, period in period_columns.items() if period >= visible_from_period]
+        removed_period_columns = [col for col, period in period_columns.items() if period < visible_from_period]
+        keep_columns = [
+            col
+            for col in range(last_meaningful_column + 1)
+            if col not in period_columns or col in kept_period_columns
+        ]
 
         replacements = 0
         visible = 0
 
         for row_index in range(header_row_index + 1, read_sheet.nrows):
-            for col_index in target_columns:
+            for col_index in kept_period_columns:
                 value = read_sheet.cell_value(row_index, col_index)
                 text = str(value).strip()
                 if not text:
@@ -247,12 +415,18 @@ def anonymize_workbook(raw_copy_path: Path, public_output_path: Path, allowed_va
                 replace_cell_preserving_style(write_book, write_sheet, row_index, col_index, "OBSAZENO")
                 replacements += 1
 
+        if removed_period_columns:
+            prune_sheet_columns(write_sheet, keep_columns)
+
         total_replacements += replacements
         total_visible += visible
+        total_removed_columns += len(removed_period_columns)
         sheet_stats.append(
             {
                 "sheet_name": read_sheet.name,
-                "period_columns": len(target_columns),
+                "period_columns": len(period_columns),
+                "kept_period_columns": len(kept_period_columns),
+                "removed_past_period_columns": len(removed_period_columns),
                 "replacements": replacements,
                 "visible_values": visible,
             }
@@ -273,6 +447,8 @@ def anonymize_workbook(raw_copy_path: Path, public_output_path: Path, allowed_va
         "sheet_stats": sheet_stats,
         "total_replacements": total_replacements,
         "total_visible_values": total_visible,
+        "total_removed_past_period_columns": total_removed_columns,
+        "visible_from_period": format_period_for_state(visible_from_period),
     }
 
 
@@ -280,6 +456,7 @@ def main() -> int:
     args = parse_args()
     config = load_json_config(args.config)
     settings = build_settings(args, config)
+    visible_from_period = current_period()
 
     source_path = resolve_source(settings)
     if source_path is None:
@@ -297,7 +474,7 @@ def main() -> int:
 
     current_signature = file_signature(source_path)
     previous_signature = state.get("source_signature")
-    if previous_signature == current_signature:
+    if previous_signature == current_signature and state.get("visible_from_period") == format_period_for_state(visible_from_period):
         print("Source workbook has not changed since the last successful sync.")
         return 0
 
@@ -314,6 +491,7 @@ def main() -> int:
         print(f"Would sync from: {source_path}")
         print(f"Would archive raw copy to: {raw_archive_path}")
         print(f"Would write anonymized copy to: {public_latest_path}")
+        print(f"Would keep periods from: {format_period_for_state(visible_from_period)}")
         return 0
 
     copy_signature = copy_source_to_local_archive(source_path, raw_archive_path)
@@ -325,6 +503,7 @@ def main() -> int:
         public_output_path=public_latest_path,
         allowed_values=settings.allowed_values,
         header_row_index=settings.header_row_index,
+        visible_from_period=visible_from_period,
     )
     ensure_directory(public_archive_path.parent)
     shutil.copy2(public_latest_path, public_archive_path)
@@ -355,6 +534,7 @@ def main() -> int:
         "Replacements: "
         f"{anonymize_stats['total_replacements']}, kept visible: {anonymize_stats['total_visible_values']}"
     )
+    print(f"Removed past period columns: {anonymize_stats['total_removed_past_period_columns']}")
     return 0
 
 
