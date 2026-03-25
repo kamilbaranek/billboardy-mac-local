@@ -1,0 +1,11 @@
+{
+  "mount_names": [
+    "COMPANY"
+  ],
+  "share_relative_path": "rezervace od 2025.xls",
+  "output_root": "/Users/kamilbaranek/dev/billboardy/output",
+  "allowed_values": [
+    "volný"
+  ],
+  "header_row_index": 0
+}
